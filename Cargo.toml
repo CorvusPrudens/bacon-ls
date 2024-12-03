@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3.18", default-features = false, features = 
     "env-filter",
     "fmt",
 ] }
+notify-debouncer-full = "0.4"
 
 [dev-dependencies]
 test-log = { version = "0.2.16", features = ["trace"] }

@@ -2,12 +2,13 @@
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
 
 use argh::FromArgs;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tower_lsp::{jsonrpc, Client, LanguageServer};
 use tower_lsp::{lsp_types::*, LspService, Server};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -45,17 +46,17 @@ impl Default for State {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BaconLs {
-    client: Option<Client>,
-    state: RwLock<State>,
+    client: Arc<RwLock<Option<Client>>>,
+    state: Arc<RwLock<State>>,
 }
 
 impl Default for BaconLs {
     fn default() -> Self {
         Self {
-            client: None,
-            state: RwLock::new(State::default()),
+            client: Arc::new(RwLock::new(None)),
+            state: Arc::new(RwLock::new(State::default())),
         }
     }
 }
@@ -63,8 +64,8 @@ impl Default for BaconLs {
 impl BaconLs {
     fn new(client: Client) -> Self {
         Self {
-            client: Some(client),
-            state: RwLock::new(State::default()),
+            client: Arc::new(RwLock::new(Some(client))),
+            state: Arc::new(RwLock::new(State::default())),
         }
     }
 
@@ -90,6 +91,37 @@ impl BaconLs {
         }
     }
 
+    /// Send a progress notification.
+    ///
+    /// If `start` is true, a `begin` notification is sent.
+    /// Otherwise, `end` is sent.
+    async fn send_progress(&self, client: &Client, start: bool) {
+        let work_done = if start {
+            let state = self.state.read().await;
+            let message = state.spawn_bacon.then(|| state.spawn_bacon_command.clone());
+
+            WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                title: "working".into(),
+                cancellable: Some(false),
+                message,
+                percentage: None,
+            })
+        } else {
+            WorkDoneProgress::End(Default::default())
+        };
+
+        client
+            .send_notification::<tower_lsp::lsp_types::notification::Progress>(
+                tower_lsp::lsp_types::ProgressParams {
+                    // We only report one kind of progress, so no
+                    // special tracking is required.
+                    token: ProgressToken::Number(0),
+                    value: ProgressParamsValue::WorkDone(work_done),
+                },
+            )
+            .await;
+    }
+
     /// Run the LSP server.
     pub async fn serve() {
         Self::configure_tracing(None);
@@ -99,6 +131,23 @@ impl BaconLs {
         // Start the service.
         let (service, socket) = LspService::new(Self::new);
         Server::new(stdin, stdout, socket).serve(service).await;
+    }
+
+    /// Gather all locations files.
+    async fn locations_files(&self) -> Vec<std::path::PathBuf> {
+        let state = self.state.read().await;
+        let locations_file = state.locations_file.clone();
+        let workspace_folders = state.workspace_folders.clone();
+        drop(state);
+
+        let mut locations = Vec::new();
+        if let Some(workspace_folders) = workspace_folders.as_ref() {
+            for folder in workspace_folders.iter() {
+                let bacon_locations = Path::new(&folder.name).join(&locations_file);
+                locations.push(bacon_locations);
+            }
+        }
+        locations
     }
 
     async fn diagnostics(&self, uri: Option<&Url>) -> Vec<(Url, Diagnostic)> {
@@ -296,8 +345,93 @@ impl LanguageServer for BaconLs {
                 }
             }
         }
+
         tracing::debug!("loaded state from lsp settings: {state:#?}");
         drop(state);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        std::thread::spawn({
+            let locations = self.locations_files().await;
+            move || {
+                use notify_debouncer_full::{new_debouncer, notify::*, DebounceEventResult};
+
+                // send an initial notification on startup
+                tx.send(()).expect("Error sending event");
+
+                let mut watcher = new_debouncer(
+                    std::time::Duration::from_millis(100),
+                    None,
+                    move |ev: DebounceEventResult| {
+                        if let Ok(ev) = ev {
+                            if ev.iter().any(|e| {
+                                matches!(e.kind, EventKind::Create(_) | EventKind::Modify(_))
+                            }) {
+                                tx.send(()).expect("Error sending event");
+                            }
+                        }
+                    },
+                )
+                .unwrap();
+
+                for path in locations {
+                    watcher.watch(&path, RecursiveMode::NonRecursive).unwrap();
+                }
+
+                std::thread::park();
+            }
+        });
+
+        tokio::spawn({
+            let server = self.clone();
+
+            let mut reports = HashMap::<_, Vec<_>>::new();
+
+            async move {
+                while let Some(()) = rx.recv().await {
+                    tracing::debug!("Received watch update");
+                    let client = server.client.read().await;
+
+                    if let Some(client) = client.as_ref() {
+                        let diagnostics = server.diagnostics(None).await;
+                        let mut map = HashMap::<_, Vec<_>>::new();
+                        for (uri, diag) in diagnostics {
+                            let diags = map.entry(uri).or_default();
+                            diags.push(diag);
+                        }
+
+                        for (uri, diagnostic) in map.iter() {
+                            let publish = match reports.get(uri) {
+                                Some(d) => d != diagnostic,
+                                None => true,
+                            };
+
+                            if publish {
+                                client
+                                    .publish_diagnostics(uri.clone(), diagnostic.clone(), None)
+                                    .await;
+                                reports.insert(uri.clone(), diagnostic.clone());
+                            }
+                        }
+
+                        let mut empty = Vec::new();
+                        reports.retain(|k, _| {
+                            if !map.contains_key(k) {
+                                empty.push(k.clone());
+                                false
+                            } else {
+                                true
+                            }
+                        });
+
+                        for uri in empty {
+                            client.publish_diagnostics(uri, vec![], None).await;
+                        }
+
+                        server.send_progress(client, false).await;
+                    }
+                }
+            }
+        });
 
         if spawn_bacon {
             self.spawn_bacon().await;
@@ -307,9 +441,6 @@ impl LanguageServer for BaconLs {
             capabilities: ServerCapabilities {
                 // Only support UTF-16 positions for now, which is the default when unspecified
                 position_encoding: Some(PositionEncodingKind::UTF16),
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
-                )),
                 diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
                     DiagnosticOptions {
                         workspace_diagnostics: true,
@@ -327,7 +458,7 @@ impl LanguageServer for BaconLs {
 
     #[tracing::instrument(skip_all)]
     async fn initialized(&self, _: InitializedParams) {
-        if let Some(client) = self.client.as_ref() {
+        if let Some(client) = self.client.read().await.as_ref() {
             tracing::info!("{PKG_NAME} v{PKG_VERSION} lsp server initialized");
             client
                 .log_message(
@@ -373,8 +504,9 @@ impl LanguageServer for BaconLs {
     ) -> jsonrpc::Result<DocumentDiagnosticReportResult> {
         tracing::debug!("client sent diagnostics request");
         let diagnostics = self.diagnostics_vec(Some(&params.text_document.uri)).await;
-        let client = self
-            .client
+        let client = self.client.read().await;
+
+        let client = client
             .as_ref()
             .ok_or_else(|| jsonrpc::Error::new(jsonrpc::ErrorCode::InternalError))?;
 
@@ -400,7 +532,8 @@ impl LanguageServer for BaconLs {
     #[tracing::instrument(skip_all)]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         tracing::debug!("client sent didOpen request");
-        if let Some(client) = self.client.as_ref() {
+        let client = self.client.read().await;
+        if let Some(client) = client.as_ref() {
             client
                 .publish_diagnostics(
                     params.text_document.uri.clone(),
@@ -414,7 +547,8 @@ impl LanguageServer for BaconLs {
     #[tracing::instrument(skip_all)]
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         tracing::debug!("client sent didClose request");
-        if let Some(client) = self.client.as_ref() {
+        let client = self.client.read().await;
+        if let Some(client) = client.as_ref() {
             client
                 .publish_diagnostics(
                     params.text_document.uri.clone(),
@@ -431,22 +565,18 @@ impl LanguageServer for BaconLs {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+    async fn did_save(&self, _: DidSaveTextDocumentParams) {
         tracing::debug!("client sent didSave request");
-        if let Some(client) = self.client.as_ref() {
-            client
-                .publish_diagnostics(
-                    params.text_document.uri.clone(),
-                    self.diagnostics_vec(Some(&params.text_document.uri)).await,
-                    None,
-                )
-                .await;
+        let client = self.client.read().await;
+        if let Some(client) = client.as_ref() {
+            self.send_progress(client, true).await;
         }
     }
 
     #[tracing::instrument(skip_all)]
     async fn shutdown(&self) -> jsonrpc::Result<()> {
-        if let Some(client) = self.client.as_ref() {
+        let client = self.client.read().await;
+        if let Some(client) = client.as_ref() {
             tracing::info!("{PKG_NAME} v{PKG_VERSION} lsp server stopped");
             client
                 .log_message(
